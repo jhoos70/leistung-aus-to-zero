@@ -7,20 +7,22 @@
         "url": "https://github.com/ta2k/ioBroker.weishaupt-wem/issues"
     },
     "dependencies": {
-        "@iobroker/adapter-core": "^3.2.2",
-        "axios": "^1.7.7",
-        "http-cookie-agent": "^5.0.4",
-        "jsdom": "^21.1.2",
-        "json2iob": "^2.6.12",
-        "tough-cookie": "^4.1.4"
+        "@iobroker/adapter-core": "^3.4.3",
+        "axios": "^1.19.0",
+        "http-cookie-agent": "^8.0.0",
+        "jsdom": "^30.0.1",
+        "json2iob": "^2.6.25",
+        "tough-cookie": "^6.0.2"
     },
     "deprecated": false,
     "description": "Adapter for weishaupt WEM Portal",
     "devDependencies": {
-        "@iobroker/testing": "^5.0.0",
-        "@types/node": "^22.7.5",
-        "eslint": "^8.57.1",
-        "typescript": "~5.6.3"
+        "@eslint/js": "^10.0.1",
+        "@iobroker/testing": "^5.3.0",
+        "@types/node": "^22.20.1",
+        "eslint": "^10.9.0",
+        "globals": "^17.11.0",
+        "typescript": "~7.0.2"
       },
     "homepage": "https://github.com/ta2k/ioBroker.weishaupt-wem",
     "keywords": [
@@ -43,5 +45,5 @@
         "test:package": "mocha test/package --exit",
         "test:unit": "mocha test/unit --exit"
     },
-    "version": "0.0.17"
+    "version": "0.0.18"
 }

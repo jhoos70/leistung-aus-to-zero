@@ -51,6 +51,16 @@ class WeishauptWem extends utils.Adapter {
         this.updateInterval = null;
         this.dataPointId = 0;
         this.deviceArray = [];
+        // Timestamp until which we skip all portal requests after a 403.
+        // The WEM portal (Azure Application Gateway) rate-limits/bans the IP on
+        // request bursts. The 403 carries no Retry-After header, so we use a fixed
+        // backoff. The observed cooldown is ~1-2 min; 5 min is a safe margin that
+        // still resumes within a normal poll cycle.
+        this.blockedUntil = 0;
+        this.backoffMs = 5 * 60 * 1000;
+        // Statistics are heavy; only fetch once per hour.
+        this.lastStatisticsFetch = 0;
+        this.apiVersion = null;
         this.json2iob = new json2iob(this);
     }
 
@@ -63,184 +73,447 @@ class WeishauptWem extends utils.Adapter {
         this.setState("info.connection", false, true);
         // Reset the connection indicator during startup
 
-        await this.login();
-        this.log.debug("Start first switchFachmann");
-        await this.switchFachmann();
-        await this.getStatus();
-        if (this.config.useApp) {
-            this.log.info("Start App Login");
-            const isLoggedInApp = await this.loginApp();
-            if (isLoggedInApp) {
-                this.log.info("App Login successful");
-                await this.getAppDevices();
-                await this.getParameters();
-                await this.getAppStatus();
+        // The WEM portal is served under different regional domains (.com / .de).
+        // Allow the user to select the one their account is served under, default to .com.
+        this.baseUrl = this.config.baseUrl || "https://www.wemportal.com";
+        try {
+            this.host = new URL(this.baseUrl).host;
+        } catch (e) {
+            this.log.warn(
+                `Invalid baseUrl "${this.baseUrl}" (${e.message}), falling back to https://www.wemportal.com`,
+            );
+            this.baseUrl = "https://www.wemportal.com";
+            this.host = "www.wemportal.com";
+        }
+        this.log.info(`Using WEM portal: ${this.baseUrl}`);
+
+        try {
+            await this.login();
+            this.log.debug("Start first switchFachmann");
+            await this.switchFachmann();
+            await this.getStatus();
+            if (this.config.useApp) {
+                this.log.info("Start App Login");
+                const isLoggedInApp = await this.loginApp();
+                if (isLoggedInApp) {
+                    this.log.info("App Login successful");
+                    await this.getAppDevices();
+                    await this.getParameters();
+                    await this.getAppStatus();
+                }
             }
+        } catch (error) {
+            this.log.error("Initialization failed, will retry on the next interval");
+            this.log.error(error);
         }
         this.updateInterval = setInterval(() => {
-            this.getStatus();
+            this.getStatus().catch((error) => this.log.error(error));
 
             if (this.config.useApp) {
-                this.getAppStatus();
+                this.getAppStatus().catch((error) => this.log.error(error));
             }
         }, this.config.interval * 60 * 1000);
 
         this.refreshTokenInterval = setInterval(() => {
-            this.loginApp();
+            this.loginApp().catch((error) => this.log.error(error));
         }, 3 * 60 * 60 * 1000);
 
         this.subscribeStates("*");
     }
 
-    async loginApp() {
-        return await this.requestClient({
-            method: "post",
-            maxBodyLength: Infinity,
-            url: "https://www.wemportal.com/app/Account/Login",
-            headers: {
-                "Content-Type": "application/json",
+    /**
+     * Build the standard app API headers. Values verified against the Weishaupt
+     * app APK v3.0.1 (de.weishaupt.wemapp NetworkModule interceptor):
+     * User-Agent WeishauptWEMApp, Accept application/json, X-Api-Version 2.0.0.0.
+     * Pass `extra` to override single headers.
+     */
+    buildApiHeaders(extra) {
+        return Object.assign(
+            {
+                "User-Agent": "WeishauptWEMApp",
                 "X-Api-Version": "2.0.0.0",
                 Accept: "application/json",
-                "User-Agent": "WeishauptWEMApp",
+                Host: this.host,
+                "Content-Type": "application/json",
                 "Accept-Language": "de-de",
                 Connection: "keep-alive",
             },
+            extra || {},
+        );
+    }
+
+    /**
+     * Centralized app API call. Throttles every request (portal rate-limits bursts),
+     * detects a stealthy session expiry (200 with the HTML login page), retries once
+     * after a re-login on 401/expiry, and starts a backoff window on 403.
+     * Returns the axios response, or null on failure.
+     */
+    async apiRequest(url, data, options = {}) {
+        const { headers, retry = true, delay = 1000 } = options;
+        if (this.isBackedOff("apiRequest")) {
+            return null;
+        }
+        await this.sleep(delay);
+        try {
+            const resp = await this.requestClient({
+                method: data ? "post" : "get",
+                maxBodyLength: Infinity,
+                url,
+                headers: this.buildApiHeaders(headers),
+                data: data || undefined,
+            });
+            const finalUrl = resp.request && resp.request.res && resp.request.res.responseUrl;
+            if (
+                (finalUrl && finalUrl.indexOf("Account/Login") !== -1) ||
+                (typeof resp.data === "string" && resp.data.indexOf("Account/Login") !== -1)
+            ) {
+                throw { expiredSession: true };
+            }
+            return resp;
+        } catch (error) {
+            const status = error.response && error.response.status;
+            if (status === 403) {
+                this.handle403(error);
+                return null;
+            }
+            if ((error.expiredSession || status === 401) && retry) {
+                this.log.info(`Session expired for ${url}, re-login and retry once`);
+                const ok = await this.loginApp();
+                if (!ok) {
+                    return null;
+                }
+                await this.sleep(5000);
+                return await this.apiRequest(url, data, { ...options, retry: false });
+            }
+            this.log.error(`App request failed: ${url}`);
+            this.log.error(error.message || error);
+            error.response && this.log.error(JSON.stringify(error.response.data));
+            return null;
+        }
+    }
+
+    async loginApp() {
+        if (this.isBackedOff("loginApp")) {
+            return false;
+        }
+        await this.sleep(1000);
+        return await this.requestClient({
+            method: "post",
+            maxBodyLength: Infinity,
+            url: `${this.baseUrl}/app/Account/Login`,
+            headers: this.buildApiHeaders(),
             data: {
-                AppVersion: "2.3",
+                Name: this.config.user,
                 PasswordUTF8: this.config.password,
                 AppID: "de.weishaupt.wemapp",
-                ClientOS: "iOS",
-                Name: this.config.user,
+                AppVersion: "3.0.1",
+                ClientOS: "Android",
             },
         })
             .then((resp) => {
                 this.log.debug(resp.data);
-                if (resp && resp.data.Status === 0) {
+                if (resp && resp.data && resp.data.Status === 0) {
+                    this.apiVersion = resp.data.Version;
                     return true;
-                } else {
-                    this.log.error(JSON.stringify(resp.data));
-                    this.log.error("App Login failed");
                 }
+                this.log.error(JSON.stringify(resp.data));
+                this.log.error("App Login failed");
+                return false;
             })
             .catch((error) => {
+                if (this.handle403(error)) {
+                    return false;
+                }
                 this.log.error(error);
                 error.response && this.log.error(error.response.data);
+                return false;
             });
     }
     async getAppDevices() {
-        await this.requestClient({
-            method: "get",
-            maxBodyLength: Infinity,
-            url: "https://www.wemportal.com/app/Device/Read",
-            headers: {
-                "Content-Type": "application/json",
-                "X-Api-Version": "2.0.0.0",
-                Accept: "application/json",
-                "User-Agent": "WeishauptWEMApp",
-                "Accept-Language": "de-de",
-                Connection: "keep-alive",
-            },
-        })
-            .then(async (res) => {
-                this.log.debug(JSON.stringify(res.data));
-                this.log.info(`App Found ${res.data.Devices.length} devices`);
-                for (const device of res.data.Devices) {
-                    const id = device.ID.toString();
+        const res = await this.apiRequest(`${this.baseUrl}/app/Device/Read`);
+        if (!res) {
+            return;
+        }
+        this.log.debug(JSON.stringify(res.data));
+        this.log.info(`App Found ${res.data.Devices.length} devices`);
+        for (const device of res.data.Devices) {
+            const id = device.ID.toString();
 
-                    this.deviceArray.push(device);
-                    const name = device.Name;
+            this.deviceArray.push(device);
+            const name = device.Name;
 
-                    await this.setObjectNotExistsAsync(id, {
-                        type: "device",
-                        common: {
-                            name: name + " via App",
-                        },
-                        native: {},
-                    });
-                    await this.setObjectNotExistsAsync(id + ".remote", {
-                        type: "channel",
-                        common: {
-                            name: "Remote Controls",
-                        },
-                        native: {},
-                    });
-
-                    const remoteArray = [{ command: "Refresh", name: "True = Refresh" }];
-                    remoteArray.forEach((remote) => {
-                        this.setObjectNotExists(id + ".remote." + remote.command, {
-                            type: "state",
-                            common: {
-                                name: remote.name || "",
-                                type: remote.type || "boolean",
-                                role: remote.role || "boolean",
-                                def: remote.def || false,
-                                write: true,
-                                read: true,
-                            },
-                            native: {},
-                        });
-                    });
-                    this.json2iob.parse(id, device, { preferedArrayName: "Index+Type", preferedArrayDesc: "Name" });
-                }
-            })
-            .catch((error) => {
-                this.log.error(error);
-                error.response && this.log.error(error.response.data);
+            await this.setObjectNotExistsAsync(id, {
+                type: "device",
+                common: {
+                    name: name + " via App",
+                },
+                native: {},
             });
+            await this.setObjectNotExistsAsync(id + ".remote", {
+                type: "channel",
+                common: {
+                    name: "Remote Controls",
+                },
+                native: {},
+            });
+
+            const remoteArray = [{ command: "Refresh", name: "True = Refresh" }];
+            remoteArray.forEach((remote) => {
+                this.setObjectNotExists(id + ".remote." + remote.command, {
+                    type: "state",
+                    common: {
+                        name: remote.name || "",
+                        type: remote.type || "boolean",
+                        role: remote.role || "boolean",
+                        def: remote.def || false,
+                        write: true,
+                        read: true,
+                    },
+                    native: {},
+                });
+            });
+            this.json2iob.parse(id, device, { preferedArrayName: "Index+Type", preferedArrayDesc: "Name" });
+        }
+    }
+    /**
+     * Read device connection status and error list (app/DeviceStatus/Read).
+     * Returns true if the device is online.
+     */
+    async getDeviceStatus(device) {
+        const res = await this.apiRequest(`${this.baseUrl}/app/DeviceStatus/Read`, { DeviceID: device.ID });
+        if (!res) {
+            return true; // unknown, keep polling
+        }
+        const data = res.data;
+        const statusMap = { 0: "online", 7: "wrong_secret", 8: "busy", 50: "offline" };
+        const connStatus = statusMap[data.ConnectionStatus] || "unknown";
+        const errors = Array.isArray(data.Errors) ? data.Errors : [];
+        await this.setObjectNotExistsAsync(device.ID + ".status", {
+            type: "channel",
+            common: { name: "Device status" },
+            native: {},
+        });
+        const statusStates = {
+            ConnectionStatus: connStatus,
+            HasErrors: errors.length > 0,
+            ErrorMessages: errors.map((e) => (typeof e === "string" ? e : JSON.stringify(e))).join(", "),
+        };
+        for (const [key, value] of Object.entries(statusStates)) {
+            await this.setObjectNotExistsAsync(device.ID + ".status." + key, {
+                type: "state",
+                common: {
+                    name: key,
+                    role: "indicator",
+                    type: typeof value === "boolean" ? "boolean" : "mixed",
+                    write: false,
+                    read: true,
+                },
+                native: {},
+            });
+            this.setState(device.ID + ".status." + key, value, true);
+        }
+        if (connStatus !== "online") {
+            this.log.warn(`Device ${device.Name} is ${connStatus}`);
+        }
+        return connStatus === "online";
     }
     async getParameters() {
+        if (this.isBackedOff("getParameters")) {
+            return;
+        }
         for (const device of this.deviceArray) {
             for (const modules of device.Modules) {
                 this.log.debug(`App Fetch Status for ${device.Name} - ${modules.Name} (${modules.Type})`);
                 if (modules.Name === "System " || modules.Name === "Test") {
                     continue;
                 }
-                await this.requestClient({
-                    method: "post",
-                    maxBodyLength: Infinity,
-                    url: "https://www.wemportal.com/app/EventType/Read",
-                    headers: {
-                        Host: "www.wemportal.com",
-                        "Content-Type": "application/json",
-                        "X-Api-Version": "2.0.0.0",
-                        Accept: "application/json",
-                        "User-Agent": "WeishauptWEMApp",
-                        "Accept-Language": "de-de",
-                        Connection: "keep-alive",
+                const res = await this.apiRequest(`${this.baseUrl}/app/EventType/Read`, {
+                    DeviceID: device.ID,
+                    ModuleType: modules.Type,
+                    ModuleIndex: modules.Index,
+                });
+                if (!res) {
+                    if (Date.now() < this.blockedUntil) {
+                        // Rate limited; stop and let the backoff window pass.
+                        return;
+                    }
+                    continue;
+                }
+                modules.parameters = res.data.Parameters;
+                this.log.info(
+                    `Found ${res.data.Parameters.length} parameters for ${device.Name} - ${modules.Name} (${modules.Type})`,
+                );
+                this.json2iob.parse(device.ID + "." + modules.Index + "-" + modules.Type + ".parameters", res.data, {
+                    preferedArrayDesc: "Name",
+                    preferedArrayName: "ParameterID",
+                    channelName: "Parameters of the Module",
+                });
+            }
+        }
+    }
+    /**
+     * Fetch heating schedules for parameters of type PROGRAM (DataType === 6),
+     * via app/CircuitTimes/Refresh + Read.
+     */
+    async getCircuitTimes(device) {
+        if (!this.modulesHaveParameters(device)) {
+            return;
+        }
+        for (const modules of device.Modules) {
+            if (!Array.isArray(modules.parameters)) {
+                continue;
+            }
+            for (const parameter of modules.parameters) {
+                if (parameter.DataType !== 6) {
+                    continue;
+                }
+                const refresh = await this.apiRequest(`${this.baseUrl}/app/CircuitTimes/Refresh`, {
+                    DeviceID: device.ID,
+                    ModuleIndex: modules.Index,
+                    ModuleType: modules.Type,
+                    ParameterID: parameter.ParameterID,
+                });
+                if (!refresh || refresh.data.JobID == null) {
+                    continue;
+                }
+                await this.sleep(2000);
+                const schedule = await this.apiRequest(`${this.baseUrl}/app/CircuitTimes/Read`, {
+                    DeviceID: device.ID,
+                    JobID: refresh.data.JobID,
+                    ModuleIndex: modules.Index,
+                    ModuleType: modules.Type,
+                    ParameterID: parameter.ParameterID,
+                });
+                if (!schedule) {
+                    continue;
+                }
+                const ctBase =
+                    device.ID + "." + modules.Index + "-" + modules.Type + ".circuitTimes." + parameter.ParameterID;
+                this.json2iob.parse(ctBase, schedule.data, {
+                    channelName: "Heating schedule for " + parameter.ParameterID,
+                });
+                // Writable state: paste the edited schedule JSON here to send it back
+                // via CircuitTimes/Write. Prefilled with the current schedule.
+                await this.setObjectNotExistsAsync(ctBase + ".setSchedule", {
+                    type: "state",
+                    common: {
+                        name: "Write schedule (JSON with Type, PossibleValues, CircuitTimesDay)",
+                        role: "json",
+                        type: "string",
+                        write: true,
+                        read: true,
                     },
-                    data: {
-                        DeviceID: device.ID,
-                        ModuleType: modules.Type,
-                        ModuleIndex: modules.Index,
+                    native: {},
+                });
+                this.setState(
+                    ctBase + ".setSchedule",
+                    JSON.stringify({
+                        Type: schedule.data.Type,
+                        PossibleValues: schedule.data.PossibleValues,
+                        CircuitTimesDay: schedule.data.CircuitTimesDay,
+                    }),
+                    true,
+                );
+            }
+        }
+    }
+    /**
+     * Write a heating schedule back to the portal (app/CircuitTimes/Write).
+     * `id` is the .setSchedule state id, `val` the edited schedule JSON
+     * ({ Type, PossibleValues, CircuitTimesDay }). Verified against APK v3.0.1.
+     */
+    async writeCircuitTimes(id, val) {
+        try {
+            const parts = id.split(".");
+            const ctIdx = parts.indexOf("circuitTimes");
+            const deviceId = parts[2];
+            const moduleId = parts[3];
+            const moduleIndex = parseInt(moduleId.split("-")[0]);
+            const moduleType = parseInt(moduleId.split("-")[1]);
+            const parameterId = parts[ctIdx + 1];
+            const circuitTimes = typeof val === "string" ? JSON.parse(val) : val;
+            const requestData = {
+                DeviceID: parseInt(deviceId),
+                ModuleType: moduleType,
+                ModuleIndex: moduleIndex,
+                ParameterID: parameterId,
+                CircuitTimes: {
+                    Type: circuitTimes.Type,
+                    PossibleValues: circuitTimes.PossibleValues,
+                    CircuitTimesDay: circuitTimes.CircuitTimesDay,
+                },
+            };
+            const res = await this.apiRequest(`${this.baseUrl}/app/CircuitTimes/Write`, requestData);
+            if (res) {
+                this.log.info(`CircuitTimes written for ${parameterId}: ${JSON.stringify(res.data)}`);
+            }
+        } catch (error) {
+            this.log.error(
+                "Failed to write CircuitTimes. Expected JSON with { Type, PossibleValues, CircuitTimesDay }",
+            );
+            this.log.error(error.message || error);
+        }
+    }
+    modulesHaveParameters(device) {
+        return device.Modules.some((m) => Array.isArray(m.parameters) && m.parameters.length > 0);
+    }
+    /**
+     * Fetch historical energy statistics (app/Statistics/Refresh + Read).
+     * Rate limited to once per hour, mirroring hass-WEM-Portal.
+     */
+    async getStatistics() {
+        const now = Date.now();
+        if (now - this.lastStatisticsFetch < 60 * 60 * 1000) {
+            return;
+        }
+        this.lastStatisticsFetch = now;
+        for (const device of this.deviceArray) {
+            const refresh = await this.apiRequest(`${this.baseUrl}/app/Statistics/Refresh`, { DeviceID: device.ID });
+            if (!refresh) {
+                continue;
+            }
+            const groups = refresh.data.GroupTypeDescriptions || [];
+            for (const group of groups) {
+                const groupId = group.GroupType;
+                const stats = await this.apiRequest(`${this.baseUrl}/app/Statistics/Read`, {
+                    DeviceID: device.ID,
+                    ModuleType: 7,
+                    ModuleIndex: 0,
+                    GroupType: groupId,
+                    Type: 1,
+                });
+                if (!stats) {
+                    continue;
+                }
+                const values = stats.data.Values || [];
+                if (!values.length) {
+                    continue;
+                }
+                const latest = values[values.length - 1];
+                const id = device.ID + ".statistics.Energy_" + groupId;
+                await this.setObjectNotExistsAsync(id, {
+                    type: "state",
+                    common: {
+                        name: group.Description || "Energy " + groupId,
+                        role: "value.power.consumption",
+                        type: "number",
+                        unit: stats.data.Unit || "kWh",
+                        write: false,
+                        read: true,
                     },
-                })
-                    .then((res) => {
-                        this.log.debug(res.data);
-                        modules.parameters = res.data.Parameters;
-                        this.log.info(
-                            `Found ${res.data.Parameters.length} parameters for ${device.Name} - ${modules.Name} (${modules.Type})`,
-                        );
-                        this.json2iob.parse(
-                            device.ID + "." + modules.Index + "-" + modules.Type + ".parameters",
-                            res.data,
-                            {
-                                preferedArrayDesc: "Name",
-                                preferedArrayName: "ParameterID",
-                                channelName: "Parameters of the Module",
-                            },
-                        );
-                    })
-                    .catch((error) => {
-                        this.log.error(`Failed for ${device.Name} - ${modules.Name} (${modules.Type})`);
-                        this.log.error(error);
-                        error.response && this.log.error(JSON.stringify(error.response.data));
-                    });
+                    native: {},
+                });
+                this.setState(id, latest.Value != null ? latest.Value : 0, true);
             }
         }
     }
     async getAppStatus() {
-        let requestData = {};
+        if (this.isBackedOff("getAppStatus")) {
+            return;
+        }
+        let requestData;
         for (const device of this.deviceArray) {
+            await this.getDeviceStatus(device);
             requestData = { DeviceID: device.ID, Modules: [] };
             for (const modules of device.Modules) {
                 if (modules.Name.trim() === "System" || modules.Name.trim() === "Test") {
@@ -248,6 +521,12 @@ class WeishauptWem extends utils.Adapter {
                 }
                 const moduleObject = { ModuleType: modules.Type, ModuleIndex: modules.Index, Parameters: [] };
 
+                if (!Array.isArray(modules.parameters)) {
+                    this.log.debug(
+                        `No parameters loaded for ${device.Name} - ${modules.Name} (${modules.Type}), skipping`,
+                    );
+                    continue;
+                }
                 for (const parameter of modules.parameters) {
                     this.log.debug(
                         `Fetch Status for ${device.Name} - ${modules.Name} (${modules.Type}) - ${parameter.Name}`,
@@ -259,77 +538,40 @@ class WeishauptWem extends utils.Adapter {
                 }
             }
             this.log.debug(JSON.stringify(requestData));
+            if (requestData.Modules.length === 0) {
+                continue;
+            }
             //Refresh
-            await this.requestClient({
-                method: "post",
-                url: "https://www.wemportal.com/app/DataAccess/Refresh",
-                headers: {
-                    Host: "www.wemportal.com",
-                    "Content-Type": "application/json",
-                    "X-Api-Version": "2.0.0.0",
-                    Accept: "application/json",
-                    "User-Agent": "WeishauptWEMApp",
-                    "Accept-Language": "de-de",
-                    Connection: "keep-alive",
-                },
-                data: requestData,
-            })
-                .then((res) => {
-                    this.log.debug(res.data);
-                })
-                .catch((error) => {
-                    if (error.response && error.response.status === 401) {
-                        this.reLoginTimeout && clearTimeout(this.reLoginTimeout);
-                        this.reLoginTimeout = setTimeout(() => {
-                            this.log.warn("Re-Login in 5 Minutes");
-                            this.loginApp();
-                        }, 5 * 60 * 1000);
-                        return;
-                    }
-                    this.log.error(`App Failed to Refresh`);
-                    this.log.error(error);
-                    error.response && this.log.error(JSON.stringify(error.response.data));
-                });
+            await this.apiRequest(`${this.baseUrl}/app/DataAccess/Refresh`, requestData);
+            // Give the backend time to build the refreshed values before reading them.
+            await this.sleep(5000);
             //Read
-            await this.requestClient({
-                method: "post",
-                maxBodyLength: Infinity,
-                url: "https://www.wemportal.com/app/DataAccess/Read",
-                headers: {
-                    Host: "www.wemportal.com",
-                    "Content-Type": "application/json",
-                    "X-Api-Version": "2.0.0.0",
-                    Accept: "application/json",
-                    "User-Agent": "WeishauptWEMApp",
-                    "Accept-Language": "de-de",
-                    Connection: "keep-alive",
-                },
-                data: requestData,
-            })
-                .then((res) => {
-                    this.log.debug(res.data);
-                    for (const modules of res.data.Modules) {
-                        this.json2iob.parse(
-                            device.ID + "." + modules.ModuleIndex + "-" + modules.ModuleType + ".parameters",
-                            modules.Values,
-                            { write: true, preferedArrayName: "ParameterID" },
-                        );
-                    }
-                })
-                .catch((error) => {
-                    this.log.error(`App Failed to Read`);
-                    this.log.error(error);
-                    error.response && this.log.error(JSON.stringify(error.response.data));
-                });
+            const res = await this.apiRequest(`${this.baseUrl}/app/DataAccess/Read`, requestData);
+            if (res) {
+                for (const modules of res.data.Modules) {
+                    this.json2iob.parse(
+                        device.ID + "." + modules.ModuleIndex + "-" + modules.ModuleType + ".parameters",
+                        modules.Values,
+                        { write: true, preferedArrayName: "ParameterID" },
+                    );
+                }
+            }
+            //Heating schedules
+            await this.getCircuitTimes(device);
         }
+        //Energy statistics (internally rate limited to once per hour)
+        await this.getStatistics();
     }
 
     async login() {
         this.log.debug("Start Webportal Login");
+        if (this.isBackedOff("login")) {
+            return;
+        }
         await this.requestClient({
             method: "get",
 
-            url: "https://www.wemportal.com/Web/Login.aspx",
+            url: `${this.baseUrl}/Web/Login.aspx`,
             headers: {
                 "User-Agent":
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
@@ -352,7 +594,7 @@ class WeishauptWem extends utils.Adapter {
                 form["ctl00$content$btnLogin"] = "Anmelden";
                 await this.requestClient({
                     method: "post",
-                    url: "https://www.wemportal.com/Web/Login.aspx",
+                    url: `${this.baseUrl}/Web/Login.aspx`,
                     headers: {
                         "User-Agent":
                             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
@@ -381,18 +623,28 @@ class WeishauptWem extends utils.Adapter {
                     });
             })
             .catch((error) => {
-                this.log.error(
-                    "Failed first Login Step. Please check your login on https://www.wemportal.com/Web/Login.aspx",
-                );
+                if (error.response && error.response.status === 403) {
+                    this.handle403(error);
+                    this.log.error(
+                        `First Login Step was rejected with 403 by the Azure gateway of ${this.host}. This is usually IP rate limiting / bot protection, not a wrong password. The adapter now backs off. If you log in manually on a different domain (e.g. www.wemportal.de), also try switching the "WEM Portal Domain" setting.`,
+                    );
+                } else {
+                    this.log.error(
+                        `Failed first Login Step. Please check your login on ${this.baseUrl}/Web/Login.aspx`,
+                    );
+                }
                 this.log.warn("Only one device per account is supported");
                 this.log.error(error);
                 error.resp && this.log.error(error.resp.data);
             });
     }
     async switchFachmann() {
+        if (this.isBackedOff("switchFachmann")) {
+            return;
+        }
         await this.requestClient({
             method: "get",
-            url: "https://www.wemportal.com/Web/Default.aspx",
+            url: `${this.baseUrl}/Web/Default.aspx`,
             headers: {
                 "Accept-Language": "en-US,en;q=0.9,de-DE;q=0.8,de;q=0.7,lb;q=0.6",
                 "Accept-Encoding": "gzip, deflate, br",
@@ -423,7 +675,7 @@ class WeishauptWem extends utils.Adapter {
                     '{"logEntries":[{"Type":3},{"Type":1,"Index":"0","Data":{"text":"Übersicht","value":"110"}},{"Type":1,"Index":"1","Data":{"text":"Anlage:","value":""}},{"Type":1,"Index":"2","Data":{"text":"Benutzer","value":"222"}},{"Type":1,"Index":"3","Data":{"text":"Fachmann","value":"223","selected":true}},{"Type":1,"Index":"4","Data":{"text":"Statistik","value":"225"}},{"Type":1,"Index":"5","Data":{"text":"Datenlogger","value":"224"}}],"selectedItemIndex":"3"}';
                 await this.requestClient({
                     method: "post",
-                    url: "https://www.wemportal.com/Web/Default.aspx",
+                    url: `${this.baseUrl}/Web/Default.aspx`,
                     headers: {
                         "Accept-Language": "en-US,en;q=0.9,de-DE;q=0.8,de;q=0.7,lb;q=0.6",
                         "Accept-Encoding": "gzip, deflate, br",
@@ -460,6 +712,9 @@ class WeishauptWem extends utils.Adapter {
     }
 
     async switchState(url, value, baseValue) {
+        // The remote-control URLs are hardcoded against www.wemportal.com. Route them
+        // through the configured domain so they also work on regional portals (e.g. .de).
+        url = url.replace(/https:\/\/www\.wemportal\.(com|de)/, this.baseUrl);
         await this.requestClient({
             method: "get",
             url: url,
@@ -476,8 +731,7 @@ class WeishauptWem extends utils.Adapter {
 
                 this.log.debug(body);
                 const dom = new JSDOM(body);
-                let form = {};
-
+                const form = {};
                 for (const formElement of dom.window.document.querySelectorAll("input")) {
                     if (formElement.type === "hidden") {
                         form[formElement.name] = formElement.value;
@@ -537,11 +791,53 @@ class WeishauptWem extends utils.Adapter {
                 error.resp && this.log.error(error.resp.data);
             });
     }
+    /**
+     * Returns true while we are in a 403 backoff window and should not send requests.
+     */
+    isBackedOff(context) {
+        if (Date.now() < this.blockedUntil) {
+            this.log.warn(
+                `${context}: skipping request, backing off after 403 until ${new Date(this.blockedUntil).toLocaleString()}`,
+            );
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * If the error is a 403 from the Azure gateway, start a backoff window and stop hammering.
+     * Returns true if a 403 was handled.
+     */
+    handle403(error) {
+        if (error && error.response && error.response.status === 403) {
+            this.blockedUntil = Date.now() + this.backoffMs;
+            this.setState("info.connection", false, true);
+            this.cookieJar.removeAllCookiesSync();
+            this.log.warn(
+                `Portal returned 403 (Azure gateway rate limit / bot protection). Backing off for ${Math.round(
+                    this.backoffMs / 60000,
+                )} minutes so the IP can recover. If this repeats, increase the update interval.`,
+            );
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Small delay helper. The WEM portal throttles bursts, so we space requests out
+     * (pattern taken from the hass-WEM-Portal integration).
+     */
+    sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
     async getStatus() {
         this.log.debug("getHomesStatus");
-        await this.requestClient({
-            method: "get",
-            url: "https://www.wemportal.com/Web/Default.aspx",
+        if (this.isBackedOff("getStatus")) {
+            return;
+        }
+        await this.requestClient({            method: "get",
+            url: `${this.baseUrl}/Web/Default.aspx`,
             headers: {
                 "Accept-Language": "en-US,en;q=0.9,de-DE;q=0.8,de;q=0.7,lb;q=0.6",
                 "Accept-Encoding": "gzip, deflate, br",
@@ -556,7 +852,6 @@ class WeishauptWem extends utils.Adapter {
                 try {
                     const dom = new JSDOM(body);
                     let statusCount = 0;
-                    const form = {};
                     if (!dom.window.document.querySelector(".DeviceInfo")) {
                         this.log.info("No Status found");
                         await this.login();
@@ -714,9 +1009,10 @@ class WeishauptWem extends utils.Adapter {
                         },
                         native: {},
                     });
-                    const status = dom.window.document.querySelector(
+                    const statusElement = dom.window.document.querySelector(
                         "#ctl00_DeviceContextControl1_DeviceStatusText",
-                    ).textContent;
+                    );
+                    const status = statusElement ? statusElement.textContent : "";
                     this.setObjectNotExistsAsync(deviceInfo + ".OnlineStatus", {
                         type: "state",
                         common: {
@@ -777,20 +1073,18 @@ class WeishauptWem extends utils.Adapter {
                     this.log.error(error);
                     this.log.error(error.stack);
                     this.log.debug(body);
-                    this.log.error("Not able to parse device name and status try to relogin");
+                    this.log.error("Not able to parse device name and status, session likely expired, relogin");
                     this.setState("info.connection", false, true);
                     await this.login();
-                    this.log.debug("Login successful");
-                    this.setState("info.connection", true, true);
                     await this.switchFachmann();
-                    await this.getStatus();
+                    // Do NOT recurse into getStatus() here: on a persistently failing/blocked
+                    // portal that would create a relogin storm and trip the rate limit. The next
+                    // scheduled interval fetches fresh data.
                 }
             })
             .catch((error) => {
-                if (error.response && error.response.status === 403) {
-                    this.log.info("Not allowed to fetch data, try to relogin");
-                    this.cookieJar.removeAllCookiesSync();
-                    this.login();
+                if (this.handle403(error)) {
+                    return;
                 }
                 this.log.error(error);
                 error.resp && this.log.error(error.resp.statusCode);
@@ -969,10 +1263,6 @@ class WeishauptWem extends utils.Adapter {
                             if (isNaN(pArray[1])) {
                                 this.log.debug(pArray[1] + " is  not a number");
                             }
-                            if (pArray[0].includes("wemportal.de/")) {
-                                this.log.error("Please use wemportal.com portal");
-                                return;
-                            }
                             this.switchState(pArray[0], parseFloat(pArray[1]));
                         } catch (error) {
                             this.log.error("No valid custom befehl. Example: ");
@@ -1014,9 +1304,9 @@ class WeishauptWem extends utils.Adapter {
                     await this.requestClient({
                         method: "post",
                         maxBodyLength: Infinity,
-                        url: "https://www.wemportal.com/app/DataAccess/Write",
+                        url: `${this.baseUrl}/app/DataAccess/Write`,
                         headers: {
-                            Host: "www.wemportal.com",
+                            Host: this.host,
                             "Content-Type": "application/json",
                             "X-Api-Version": "2.0.0.0",
 
@@ -1035,7 +1325,10 @@ class WeishauptWem extends utils.Adapter {
                             error.response && this.log.error(JSON.stringify(error.response.data));
                         });
                 }
-                const refrehTimeout = setTimeout(() => {
+                if (id.indexOf(".circuitTimes.") !== -1 && id.endsWith(".setSchedule")) {
+                    await this.writeCircuitTimes(id, state.val);
+                }
+                setTimeout(() => {
                     this.getStatus();
                     if (this.config.useApp) {
                         this.getAppStatus();

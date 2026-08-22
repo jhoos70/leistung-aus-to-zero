@@ -36,6 +36,7 @@
                 onChange(false);
                 // reinitialize all the Materialize labels on the page if you are dynamically adding inputs:
                 if (M) M.updateTextFields();
+                if (M && M.FormSelect) M.FormSelect.init(document.querySelectorAll("select"));
             }
 
             // This will be called by the admin adapter when the user presses the save button
@@ -76,6 +77,15 @@
                 <div class="col s6 input-field">
                     <input type="password" class="value" id="password" />
                     <label for="password" class="translate">WEM Password</label>
+                </div>
+            </div>
+            <div class="row">
+                <div class="col s6 input-field">
+                    <select class="value" id="baseUrl">
+                        <option value="https://www.wemportal.com">www.wemportal.com</option>
+                        <option value="https://www.wemportal.de">www.wemportal.de</option>
+                    </select>
+                    <label for="baseUrl" class="translate">WEM Portal Domain</label>
                 </div>
             </div>
             <div class="row">

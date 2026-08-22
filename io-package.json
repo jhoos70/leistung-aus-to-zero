@@ -1,8 +1,12 @@
 {
     "common": {
         "name": "weishaupt-wem",
-        "version": "0.0.17",
+        "version": "0.0.18",
         "news": {
+            "0.0.18": {
+                "en": "403 backoff, throttling, robust app API with DeviceStatus/Statistics/CircuitTimes, selectable domain, crash fixes",
+                "de": "403-Backoff, Throttling, robuste App-API mit DeviceStatus/Statistics/CircuitTimes, wählbare Domain, Absturzbehebung"
+            },
             "0.0.17": {
                 "en": "Improve error and login handling",
                 "de": "Verbesserte Fehler- und Anmeldeverhalten"
@@ -113,7 +117,8 @@
         "password": "",
         "sessionid": "",
         "useApp": true,
-        "interval": 15
+        "interval": 15,
+        "baseUrl": "https://www.wemportal.com"
     },
     "objects": [],
     "instanceObjects": [

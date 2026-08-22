@@ -37,5 +37,17 @@ systemDictionary = {
 		"es": "opcion 2",
 		"pl": "Opcja 2",
 		"zh-cn": "选项2"
+	},
+	"WEM Portal Domain": {
+		"en": "WEM Portal Domain",
+		"de": "WEM Portal Domain",
+		"ru": "Домен WEM Portal",
+		"pt": "Domínio do WEM Portal",
+		"nl": "WEM Portal-domein",
+		"fr": "Domaine du portail WEM",
+		"it": "Dominio del portale WEM",
+		"es": "Dominio del portal WEM",
+		"pl": "Domena portalu WEM",
+		"zh-cn": "WEM 门户域名"
 	}
 };
