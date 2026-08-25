@@ -1048,6 +1048,21 @@ class WeishauptWem extends utils.Adapter {
                             if (valueArray[1]) {
                                 unit = valueArray[1];
                             }
+                            if (
+                                typeof value === "string" &&
+                                (value.toLowerCase() === "aus" || value.toLowerCase() === "off" || value === "--")
+                            ) {
+                                if (
+                                    labelWoSpaces === "IstLeistung" ||
+                                    labelWoSpaces === "SollLeistung" ||
+                                    labelWoSpaces.endsWith("Leistung") ||
+                                    unit === "kW" ||
+                                    unit === "%" ||
+                                    unit === "W"
+                                ) {
+                                    value = 0;
+                                }
+                            }
                             if (labelWoSpaces === "Status") {
                                 labelWoSpaces = labelWoSpaces + statusCount;
                                 statusCount++;
